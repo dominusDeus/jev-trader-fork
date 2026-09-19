@@ -6,12 +6,12 @@ El objetivo del proyecto es operar en EE. UU. y Europa con IBKR: acciones, ETFs,
 
 - Programa TypeScript que inicia un lector pequeño en Python, usando el SDK oficial de IBKR.
 - Conexión únicamente a `127.0.0.1`, puertos Paper habituales `4002` (Gateway) o `7497` (TWS), cliente no cero.
-- Cuenta explícita `DU...`, cotejada contra las cuentas de la sesión antes de suscribirse. No selecciona automáticamente la primera cuenta ni todas las cuentas.
+- Cuenta explícita `DU...` o `DUT...`, cotejada contra las cuentas de la sesión antes de suscribirse. No selecciona automáticamente la primera cuenta ni todas las cuentas.
 - Consulta de valores de cuenta por divisa y posiciones por contrato. Guarda cantidades como texto decimal; no convierte nominales de bonos o contratos de derivados en acciones. Los ETFs suelen aparecer como STK: esa etiqueta no identifica por sí sola un ETF.
 - Espera handshake y accountDownloadEnd. Error, desconexión, timeout, AccountReady=false o descarga vacía rechazan la respuesta en vez de mostrar saldo cero. AccountReady ausente se representa como null, no como true.
 - Salida JSON por consola; sin servidor HTTP, sin historial en disco ni envío al modelo. Conservá esa salida como información privada.
 
-El prefijo DU y el puerto son comprobaciones conservadoras, **no una certificación criptográfica del modo Paper**. Los puertos son configurables en IBKR. La protección principal de este lector es que sólo invoca solicitudes de lectura. readOnly=true describe al lector, no demuestra que la configuración de IBKR esté en sólo lectura. Tampoco se certifica aún que la cuenta sea Cash: AccountType puede describir la titularidad, no el régimen de margen.
+Los prefijos DU/DUT y el puerto son comprobaciones conservadoras, **no una certificación criptográfica del modo Paper**. Los puertos son configurables en IBKR. La protección principal de este lector es que sólo invoca solicitudes de lectura. readOnly=true describe al lector, no demuestra que la configuración de IBKR esté en sólo lectura. Tampoco se certifica aún que la cuenta sea Cash: AccountType puede describir la titularidad, no el régimen de margen.
 
 ## Preparación en IBKR
 
@@ -46,7 +46,7 @@ Este comando no carga `.env`, no importa la configuración cripto y no pasa clav
 ## Validación y límites
 
 - `bun run test`: incluye pruebas de configuración, identidad y formato del lector TypeScript además de las pruebas anteriores.
-- `bun run test:ibkr`: 8 pruebas Python aisladas, sin SDK ni conexión, de callbacks, cuentas ajenas, descarga incompleta, valores inválidos y tipos de contrato.
+- `bun run test:ibkr`: 9 pruebas Python aisladas, sin SDK ni conexión, de callbacks, cuentas ajenas, descarga incompleta, valores inválidos y tipos de contrato.
 - También se verificó la herencia/callbacks con el SDK oficial instalado temporalmente en `/private/tmp/jev-ibkr-venv`. Esa carpeta puede desaparecer; no es una instalación global.
 - No se hizo una conexión autenticada, ni se consultaron datos reales de la cuenta del usuario. Falta validar la descarga completa con una sesión Paper abierta.
 - No consulta permisos de trading, órdenes abiertas, catálogo de contratos, cotizaciones históricas ni suscripciones de mercado. Eso sigue en la próxima etapa. Las posiciones recibidas contienen datos de los contratos ya mantenidos; no constituyen un catálogo.

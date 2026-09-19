@@ -21,6 +21,15 @@ class ReaderTests(unittest.TestCase):
     def setUp(self):
         self.app = reader.reader_class(Client, Wrapper)("DU123")
 
+    def test_dut_paper_account_is_validated_and_matched_exactly(self):
+        self.assertEqual(reader.settings("DUT123456", 4002, 71, 15)[0], "DUT123456")
+        app = reader.reader_class(Client, Wrapper)("DUT123456")
+        app.managedAccounts("DU123456,DUT123456")
+        app.nextValidId(1)
+        self.assertEqual(app.calls, [(True, "DUT123456")])
+        for account in ["DUT", "DUX123", "UT123", "DUT123junk"]:
+            with self.assertRaises(ValueError): reader.settings(account, 4002, 71, 15)
+
     def ready(self):
         self.app.managedAccounts("U999,DU123,DU456")
         self.app.nextValidId(22)

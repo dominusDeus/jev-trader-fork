@@ -17,3 +17,8 @@ test("IBKR positions retain contract identifiers and reject duplicates", () => {
   expect(() => parseSnapshot(JSON.stringify({ ...snapshot, positions: [p, p] }), "DU123")).toThrow("Duplicate");
   expect(() => parseSnapshot(JSON.stringify({ ...snapshot, positions: [{ ...p, quantity: "NaN" }] }), "DU123")).toThrow();
 });
+
+test("IBKR accepts DUT paper identifiers without accepting arbitrary prefixes", () => {
+  expect(paperSettings({ IBKR_PAPER_ACCOUNT: "DUT123456" }).account).toBe("DUT123456");
+  for (const account of ["DU", "DUT", "DUX123", "UT123", "DUT123junk"]) expect(() => paperSettings({ IBKR_PAPER_ACCOUNT: account })).toThrow();
+});

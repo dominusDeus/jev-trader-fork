@@ -1,5 +1,9 @@
 # Punto de retomada — Jev Trader
 
+## Solicitud Paper presentada
+
+La captura del usuario confirma solicitud presentada, pendiente de procesamiento según IBKR (no activación confirmada). El identificador asignado usa prefijo DUT. Se amplió validación DU+números a DU/DUT+números, conservando comparación exacta con cuentas autenticadas, puertos Paper y sólo lectura. Se probaron ambos formatos con IDs sintéticos; no se guardaron credenciales ni el identificador real en el repo. Próximo paso: esperar activación y abrir TWS en Paper.
+
 ## Cambio de alcance: IBKR — primera implementación 19/09/2026
 
 El usuario definió IBKR, cuenta Cash, residencia fiscal España, EE. UU. + Europa, acciones/ETFs/bonos/opciones/futuros. Ya tiene ETFs que no quiere tocar y USD 100 inicialmente libres; pidió dejar la configuración de qué operar y límites para el final. Autorizó continuar la adaptación por Paper. No hay permiso para operar sus ETFs, abrir posiciones reales ni mover fondos. No volver a enfocar nuevos incrementos en gas/Kuru.
@@ -10,7 +14,7 @@ Implementado `src/ibkr/inspect.ts` + `reader.py`: lector de cuenta Paper sólo l
 
 SDK oficial descargado desde IBKR, API 10.50.2 y protobuf 5.29.5 instalados sólo en `/private/tmp/jev-ibkr-venv`. Prueba de callbacks sobre SDK real pasó sin conexión. Guía completa/versiones/checksum/comandos en `docs/IBKR-PAPER.md`.
 
-Validación actual: 106 pruebas Bun (407 aserciones) + 8 pruebas Python pasan; typecheck correcto. No hubo conexión IBKR autenticada: falta sesión Paper abierta e identificador de cuenta configurado por el usuario. No acceder a credenciales ni intentar conectar por inferencia a una sesión real. `ibkr:inspect` no carga .env ni config cripto. `start` sigue siendo Kuru; guía lo advierte.
+Validación actual: 107 pruebas Bun + 9 pruebas Python pasan; typecheck correcto. No hubo conexión IBKR autenticada: falta sesión Paper abierta e identificador de cuenta configurado por el usuario. No acceder a credenciales ni intentar conectar por inferencia a una sesión real. `ibkr:inspect` no carga .env ni config cripto. `start` sigue siendo Kuru; guía lo advierte.
 
 Siguiente: verificar lectura con Paper cuando esté disponible; agregar consulta de contratos y órdenes abiertas, después interfaz común IBKR de ejecución simulada y riesgo. Sin límite de pérdidas/equity IBKR todavía, sin asignar los ETFs o saldo total al bot. Clasificación Cash y permisos no verificados por el lector. No inferir ETF sólo desde secType=STK. Límites económicos y activos autorizados se cierran antes de cualquier habilitación real.
 

@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 export interface PaperSettings { account: string; port: number; clientId: number; timeout: number }
 export function paperSettings(env: Record<string, string | undefined>): PaperSettings {
   const account = env.IBKR_PAPER_ACCOUNT ?? "";
-  if (!/^DU\d+$/.test(account)) throw new Error("IBKR_PAPER_ACCOUNT must be the exact DU paper account");
+  if (!/^DUT?\d+$/.test(account)) throw new Error("IBKR_PAPER_ACCOUNT must be the exact DU/DUT paper account");
   const integer = (key: string, fallback: number, min: number, max: number) => {
     const raw = env[key] ?? String(fallback), value = Number(raw);
     if (!/^\d+$/.test(raw) || !Number.isSafeInteger(value) || value < min || value > max) throw new Error(`Invalid ${key}`);

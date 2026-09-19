@@ -9,8 +9,8 @@ from decimal import Decimal
 
 
 def settings(account, port, client_id, timeout):
-    if not re.fullmatch(r"DU[0-9]+", account):
-        raise ValueError("Specify the exact DU paper account; live accounts are unsupported")
+    if not re.fullmatch(r"DUT?[0-9]+", account):
+        raise ValueError("Specify the exact DU/DUT paper account; live accounts are unsupported")
     if port not in (4002, 7497) or not 1 <= client_id <= 2147483647 or not 1 <= timeout <= 60:
         raise ValueError("Use paper port 4002/7497, positive client ID and timeout 1..60")
     return account, port, client_id, timeout
