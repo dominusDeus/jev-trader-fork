@@ -18,6 +18,8 @@
   },
   "scripts": {
     "start": "bun run src/index.ts",
-    "dev": "bun --watch run src/index.ts"
+    "dev": "bun --watch run src/index.ts",
+    "test": "bun test --no-env-file --preload ./tests/setup.ts ./tests",
+    "typecheck": "tsc --noEmit"
   }
 }

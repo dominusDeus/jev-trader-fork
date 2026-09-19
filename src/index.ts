@@ -7,12 +7,15 @@ import { log10 } from "./book";
 import { startServer } from "./server";
 
 const market = new Market();
+// Close the journal on normal exit; SQLite releases its exclusive file lock on crashes too.
+process.on("exit", () => market.journal?.close());
 await market.init();
 const model = createModel();
 
 const server = startServer(
   { model: model.name, wallet: market.address, dryRun: config.dryRun, market: config.market, startedAt: Date.now() },
   () => trader.history,
+  () => ({ ...trader.status, gasBudget: market.gasBudgetStatus, modelBudget: trader.modelBudgetStatus }),
 );
 const trader = new Trader(
   market,
@@ -32,10 +35,14 @@ const trader = new Trader(
   },
   (block, quote) => {
     server.broadcastQuote(block, quote);
+    if (quote.kind === "cancel") {
+      console.log(`#${block} CANCEL ${quote.status.toUpperCase()} orders ${quote.cancel.join(",")} gas ${quote.gasMon.toFixed(6)} MON ${quote.txHash}`);
+      return;
+    }
     if (quote.status !== "placed") console.log(`#${block} ${quote.status.toUpperCase()} ${quote.side} @ ${quote.price.toFixed(6)} gas ${quote.gasMon.toFixed(6)} MON ${quote.txHash}`);
   },
 );
 trader.attachTradeFeed(log10(market.params.sizePrecision));
 
-console.log(`jev-trader · model=${model.name} · post-only ${config.quoteInsideTicks} tick inside the touch · horizon ${config.horizonBlocks} blocks · ${config.dryRun ? "DRY RUN" : `wallet ${market.address}`} · market ${config.market} · read ${config.readRpcUrl} · :${config.port}`);
+console.log(`jev-trader · model=${model.name} · post-only ${config.quoteInsideTicks} tick inside the touch · horizon ${config.horizonBlocks} blocks · ${config.dryRun ? "DRY RUN" : `wallet ${market.address}`} · market ${config.market} · :${config.port}`);
 startBlockFeed((block) => trader.onBlock(block));

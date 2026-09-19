@@ -6,9 +6,13 @@ export async function rpc<T = unknown>(method: string, params: unknown[] = [], u
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+    // Market retains hash, nonce and exposure when a broadcast times out.
+    signal: AbortSignal.timeout(config.rpcTimeoutMs),
   });
+  if (!res.ok) throw new Error(`${method}: HTTP ${res.status}`);
   const json = (await res.json()) as { result?: T; error?: { code: number; message: string } };
   if (json.error) throw new Error(`${method}: ${json.error.message} (${json.error.code})`);
+  if (!("result" in json)) throw new Error(`${method}: missing result`);
   return json.result as T;
 }
 

@@ -24,7 +24,7 @@ export const TRADE_TOPIC0 = "0xf16924fba1c18c108912fcacaac7450c98eb3f2d8c0a3cdf3
 export interface TradePrint { block: number; price: number; size: number; side: "buy" | "sell" }
 
 /** One of our resting orders got hit. `side` is OUR side (the maker's): a taker buy fills our ask, so side is "sell". */
-export interface MakerFill { block: number; txHash: string; orderId: number; price: number; size: number; updatedSize: number; side: "buy" | "sell" }
+export interface MakerFill { block: number; logIndex: number; txHash: string; orderId: number; price: number; size: number; updatedSize: number; side: "buy" | "sell" }
 
 export interface TradeSummary {
   count: number;
@@ -58,18 +58,23 @@ export class TradeFeed {
   private fresh: TradePrint[] = []; // appended since the last drainPrints()
   private fills: MakerFill[] = []; // appended since the last drainFills()
   private inFlight = false;
+  private hasCursor = false;
+  private onBatch?: (from: number, through: number, fills: MakerFill[]) => void;
   lastBlock = 0;
 
   /**
    * `sizeDec` = log10(sizePrecision) (10 on MON-USDC). `priceDec` defaults to 18; override only if
    * Kuru changes the event. `maker` is our wallet: Trade logs with that makerAddress become fills.
    */
-  constructor(opts: { market: string; url: string; sizeDec: number; priceDec?: number; maker?: string | null }) {
+  constructor(opts: { market: string; url: string; sizeDec: number; priceDec?: number; maker?: string | null; startBlock?: number; onBatch?: (from: number, through: number, fills: MakerFill[]) => void }) {
     this.market = opts.market;
     this.url = opts.url;
     this.priceDec = opts.priceDec ?? TRADE_PRICE_DEC;
     this.sizeDec = opts.sizeDec;
     this.maker = opts.maker?.toLowerCase() ?? null;
+    this.hasCursor = opts.startBlock !== undefined;
+    this.lastBlock = opts.startBlock ?? 0;
+    this.onBatch = opts.onBatch;
   }
 
   /**
@@ -79,28 +84,38 @@ export class TradeFeed {
    */
   async poll(block: number): Promise<void> {
     if (this.inFlight) return;
-    let from = this.lastBlock === 0 ? Math.max(1, block - FIRST_LOOKBACK + 1) : this.lastBlock + 1;
+    const first = this.lastBlock === 0 && !this.hasCursor;
+    let from = first ? Math.max(1, block - FIRST_LOOKBACK + 1) : this.lastBlock + 1;
     if (from > block) return;
-    if (block - from + 1 > MAX_CATCHUP) from = block - MAX_CATCHUP + 1;
-    const first = this.lastBlock === 0;
+    // Bound work per poll, never skip the oldest unprocessed accounting events.
+    const until = Math.min(block, from + MAX_CATCHUP - 1);
     this.inFlight = true;
     try {
-      while (from <= block) {
-        const to = Math.min(block, from + MAX_RANGE - 1);
+      while (from <= until) {
+        const to = Math.min(until, from + MAX_RANGE - 1);
         const logs = await rpc<RawLog[]>("eth_getLogs", [{
           address: this.market,
           topics: [TRADE_TOPIC0],
           fromBlock: "0x" + from.toString(16),
           toBlock: "0x" + to.toString(16),
         }], this.url);
-        // getLogs returns in block/logIndex order; keep newest last.
-        for (const log of logs) {
-          if (log.removed) continue;
-          const t = this.decode(log, !first); // the warm-up window predates our orders: no fills from it
-          if (t) { this.trades.push(t); this.fresh.push(t); }
+        const chunkFills: MakerFill[] = [];
+        const prints: TradePrint[] = [];
+        // Stage the entire chunk; do not advance the cursor or expose fills before durable commit.
+        for (const log of logs.sort((a, b) => parseInt(a.blockNumber, 16) - parseInt(b.blockNumber, 16) || parseInt(a.logIndex, 16) - parseInt(b.logIndex, 16))) {
+          if (log.removed) throw new Error("Removed log requires reconciliation");
+          const height = parseInt(log.blockNumber, 16);
+          if (!Number.isSafeInteger(height) || height < from || height > to) throw new Error("Log outside requested range");
+          const t = this.decode(log, !first, chunkFills);
+          if (t) prints.push(t);
         }
+        this.onBatch?.(from, to, chunkFills);
+        if (!this.onBatch) this.fills.push(...chunkFills);
+        this.trades.push(...prints);
+        this.fresh.push(...prints);
         if (this.trades.length > RING) this.trades.splice(0, this.trades.length - RING);
         this.lastBlock = to;
+        this.hasCursor = true;
         from = to + 1;
       }
     } catch {
@@ -110,9 +125,9 @@ export class TradeFeed {
     }
   }
 
-  private decode(log: RawLog, collectFills: boolean): TradePrint | null {
+  private decode(log: RawLog, collectFills: boolean, fills: MakerFill[]): TradePrint | null {
     const data = log.data.startsWith("0x") ? log.data.slice(2) : log.data;
-    if (data.length < 64 * 8) return null;
+    if (data.length !== 64 * 8 || !/^[\da-f]+$/i.test(data) || !/^0x[\da-f]+$/i.test(log.logIndex)) throw new Error("Invalid Trade log");
     const word = (i: number) => BigInt("0x" + data.slice(i * 64, (i + 1) * 64));
     // 0 orderId, 1 makerAddress, 2 isBuy, 3 price, 4 updatedSize, 5 takerAddress, 6 txOrigin, 7 filledSize
     const isBuy = word(2) !== 0n;
@@ -120,9 +135,9 @@ export class TradeFeed {
     const size = toFloat(word(7), this.sizeDec);
     if (size === 0) return null;
     const block = parseInt(log.blockNumber, 16);
-    if (collectFills && this.maker && "0x" + data.slice(64 + 24, 128) === this.maker) {
-      this.fills.push({
-        block, txHash: log.transactionHash, orderId: Number(word(0)), price, size,
+    if (collectFills && this.maker && ("0x" + data.slice(64 + 24, 128)).toLowerCase() === this.maker) {
+      fills.push({
+        block, logIndex: parseInt(log.logIndex, 16), txHash: log.transactionHash, orderId: Number(word(0)), price, size,
         updatedSize: toFloat(word(4), this.sizeDec), side: isBuy ? "sell" : "buy",
       });
     }

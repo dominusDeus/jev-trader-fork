@@ -1,8 +1,11 @@
 import { appendFileSync, mkdirSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { join } from "node:path";
 import { config } from "./config";
-import { Market, type Book, type Fill, type Quote, type QuoteResult, type Side } from "./market";
+import type { Market, Book, Fill, Quote, QuoteResult, Side } from "./market";
 import type { Action, Decision, Model, TradeState } from "./model";
 import { TradeFeed, type MakerFill, type TradePrint } from "./trades";
+import { DecisionExpired, DecisionWindow } from "./deadline";
 
 export interface BlockEvent {
   block: number;
@@ -42,6 +45,7 @@ export interface Totals {
 }
 
 interface Resting { side: Side; price: number; size: number; block: number }
+export type TraderMarket = Pick<Market, "address" | "wallet" | "margin" | "journal" | "quoteBudgetReason" | "refreshNativeGas" | "verifyRestingOrders" | "hasUncertainTransactions" | "readBook" | "cancelOrders" | "send" | "pollPending" | "refresh">;
 
 /**
  * Every block: read the book, ask the model buy or sell, and post one post-only limit order on
@@ -57,55 +61,185 @@ export class Trader {
   readonly history: BlockEvent[] = [];
   private mids: number[] = [];
   private busy = false;
+  private newestBlock = 0;
+  private window: DecisionWindow | null = null;
+  private skipped: number[] = [];
   private lastBook: Book | null = null;
   private trades: TradeFeed | null = null;
   /** Orders we know are resting on the book (live: from receipts; dry run: last block's simulated order). */
   private orders = new Map<number, Resting>();
   /** Live quotes sent but not yet confirmed; they may become resting orders, so they count toward the cap. */
   private inflight = new Map<string, Quote>();
+  private receipts = new Set<string>();
+  private fillIds = new Set<string>();
+  private remainingSizes = new Map<number, number>();
+  private canceledOrders = new Set<number>();
+  private recentLiveFills = new Map<number, Fill[]>();
+  private recoveredThrough = 0;
+  private recovered = false;
+  private recovering = false;
+  private recoveryFailed = false;
+  private protection: string | null = null;
+  private modelCalls = 0;
+  private modelHistoryIncomplete = false;
   private simId = 0;
   private position = { mon: 0, costUsd: 0 }; // signed inventory and its cost basis
   private totals: Totals = { blocks: 0, decisions: 0, quotes: 0, fills: 0, reverted: 0, lateBlocks: 0, jevUsd: 0, gasMon: 0, gasUsd: 0, realizedUsd: 0, pnlUsd: 0, pnlMon: 0, pnlPct: 0 };
 
   constructor(
-    private market: Market,
+    private market: TraderMarket,
     private model: Model,
     private onEvent: (e: BlockEvent, timing?: Timing) => void,
     private onFill: (block: number, fill: Fill) => void = () => {},
     private onQuote: (block: number, quote: Quote) => void = () => {},
+    private dataDir = "data",
   ) {
-    mkdirSync("data", { recursive: true });
+    mkdirSync(dataDir, { recursive: true });
+    for (const event of market.journal?.replay() ?? []) {
+      if (event.type === "model_call") this.modelCalls++;
+      if (event.type === "protection") this.protection = event.reason;
+      if (event.type === "bootstrap") this.recoveredThrough = event.block;
+      if (event.type === "intent") {
+        this.inflight.set(event.intent.quote.txHash!, { ...event.intent.quote, status: "lost", gasMon: 0 });
+        this.totals.quotes++;
+      }
+      if (event.type === "receipt") this.applyQuoteResult(event.result, false);
+      if (event.type === "fills") {
+        if (event.from !== this.recoveredThrough + 1) throw new Error("Trading journal has a fill cursor gap");
+        this.applyLiveBatch(event.fills, false);
+        this.recoveredThrough = event.through;
+      }
+      if (event.type === "decision") {
+        if (!event.callId) this.modelHistoryIncomplete = true;
+        this.totals.decisions++;
+        this.totals.jevUsd += event.inputTokens / 1e6 * config.jevUsdPerMTok;
+      }
+    }
+    this.recovered = market.journal === null;
+  }
+
+  get modelBudgetStatus() {
+    return { callsAllocated: this.modelCalls, callLimit: config.modelCallLimit, paid: this.model.paid === true, reason: this.modelBudgetReason };
+  }
+  private get modelBudgetReason() {
+    if (!this.model.paid) return null;
+    if (!this.market.journal) return "model_journal_required";
+    if (this.modelHistoryIncomplete) return "model_history_incomplete";
+    if (!config.modelCallLimit) return "model_budget_unconfigured";
+    return this.modelCalls >= config.modelCallLimit ? "model_budget_exhausted" : null;
+  }
+
+  get status() {
+    const cursor = this.trades?.lastBlock ?? this.recoveredThrough;
+    if (this.market.journal && !this.market.journal.available) return { state: "paused", reason: "storage_unavailable", cursor };
+    if (this.modelBudgetReason) return { state: "paused", reason: this.modelBudgetReason, cursor };
+    if (this.market.quoteBudgetReason) return { state: "paused", reason: this.market.quoteBudgetReason, cursor };
+    if (this.protection) return { state: "paused", reason: this.protection, cursor };
+    if (!this.recovered) return { state: "reconciling", reason: this.recoveryFailed ? "verification_failed" : "restoring_state", cursor };
+    if (this.market.hasUncertainTransactions) return { state: "paused", reason: "unresolved_transaction", cursor };
+    if (this.market.journal && cursor < this.newestBlock) return { state: "reconciling", reason: "fill_feed_behind", cursor };
+    return { state: "running", reason: null, cursor };
   }
 
   /** Call once the market params are known. Without it `trades` in the state is all zeros and no fills are ever seen. */
   attachTradeFeed(sizeDec: number) {
-    this.trades = new TradeFeed({ market: config.market, url: config.readRpcUrl, sizeDec, maker: this.market.address });
+    this.trades = new TradeFeed({
+      market: config.market, url: config.readRpcUrl, sizeDec, maker: this.market.address,
+      ...(this.market.journal ? {
+        startBlock: this.recoveredThrough,
+        onBatch: (from: number, through: number, fills: MakerFill[]) => {
+          this.market.journal!.append({ type: "fills", from, through, fills });
+          this.applyLiveBatch(fills);
+          this.recoveredThrough = through;
+        },
+      } : {}),
+    });
+  }
+
+  /** No decisions until persisted intents, all missed fills and resting sizes are checked. */
+  async recover(block: number) {
+    if (this.recovered || this.recovering || !this.trades || !this.market.journal) return;
+    this.recovering = true;
+    try {
+      this.market.journal.assertAvailable();
+      const results = await this.market.pollPending(block);
+      for (const result of results) this.applyQuoteResult(result);
+      await this.trades.poll(block);
+      if (this.market.hasUncertainTransactions || this.inflight.size || this.trades.lastBlock !== block) return;
+      await this.market.verifyRestingOrders([...this.orders].map(([id, order]) => ({ id, size: order.size, price: order.price, side: order.side })), block);
+      this.recovered = true;
+      this.recoveryFailed = false;
+    } catch (error) { this.recoveryFailed = true; throw error; }
+    finally { this.recovering = false; }
   }
 
   async onBlock(block: number) {
+    if (!Number.isSafeInteger(block) || block <= this.newestBlock) return;
+    this.newestBlock = block;
     this.totals.blocks++;
+    if (this.market.journal && !this.market.journal.available) return;
+    if (!this.recovered) {
+      await this.recover(block).catch(error => console.error("recovery:", (error as Error).message));
+      return; // the next observed block gets a fresh decision budget
+    }
     this.confirmPending(block); // off the hot path: receipts for earlier blocks' sends
+    const tradePoll = this.trades?.poll(block).then(() => this.harvest());
     if (this.totals.blocks % config.refreshBlocks === 0) this.market.refresh().catch(() => {}); // fee estimate + margin + vault check
     if (this.busy) {
+      this.window?.expire();
       this.totals.lateBlocks++;
-      if (this.lastBook) this.emit(block, this.lastBook, null, null, true);
+      // Emit after the active block, including when its broadcast is still pending.
+      this.skipped.push(block);
+      if (this.skipped.length > config.historySize) this.skipped.shift();
       return;
     }
     this.busy = true;
     const t0 = performance.now();
+    const window = this.window = new DecisionWindow(config.decisionDeadlineMs);
     try {
-      const book = await this.market.readBook();
+      if (this.modelBudgetReason) this.protect(this.modelBudgetReason);
+      if (this.protection) {
+        // Refresh a previous low/unavailable balance without asking the model.
+        await this.market.refreshNativeGas(block).catch(() => {});
+      } else {
+        try { await window.wait(() => this.market.refreshNativeGas(block)); }
+        catch (error) {
+          if (this.market.quoteBudgetReason) this.protect(this.market.quoteBudgetReason);
+          throw error;
+        }
+      }
+      if (this.market.quoteBudgetReason) this.protect(this.market.quoteBudgetReason);
+      if (this.protection) {
+        await tradePoll;
+        await this.cancelForProtection(block);
+        return; // only a subsequent block can resume decisions
+      }
+      const book = await window.wait(() => this.market.readBook(window.signal));
       const readMs = performance.now() - t0;
+      if (!Number.isSafeInteger(book.block) || book.block < block) throw new DecisionExpired();
       this.lastBook = book;
       this.mids.push(book.mid);
       if (this.mids.length > 400) this.mids.shift();
-      this.trades?.poll(block).then(() => this.harvest()); // off the hot path: eth_getLogs for prints (and our fills) since the last poll
 
-      const decision = await this.model.decide(this.buildState(block, book));
+      let callId: string | undefined;
+      const decision = await window.wait(() => {
+        const state = this.buildState(block, book);
+        window.assertFresh();
+        if (this.model.paid) {
+          const reason = this.modelBudgetReason;
+          if (reason) throw new Error(reason);
+          callId = randomUUID();
+          this.market.journal!.append({ type: "model_call", callId, block, model: this.model.name });
+          this.modelCalls++; // reserve before the request, including failed/late calls
+          window.assertFresh();
+        }
+        return this.model.decide(state, window.signal);
+      });
+      this.market.journal?.append({ type: "decision", inputTokens: decision.inputTokens, ...(callId ? { callId } : {}) });
       const wanted: Side = decision.action === "sell" ? "sell" : "buy";
       const other: Side = wanted === "buy" ? "sell" : "buy";
       // The position cap (and, live, margin funds) can only pick the reducing side. The probabilities still show the model's call.
-      const side: Side | null = this.allowed(wanted, book) ? wanted : this.allowed(other, book) ? other : null;
+      const side: Side | null = decision.action === "hold" ? null : this.allowed(wanted, book) ? wanted : this.allowed(other, book) ? other : null;
       this.totals.decisions++;
       this.totals.jevUsd += (decision.inputTokens / 1e6) * config.jevUsdPerMTok;
 
@@ -113,7 +247,8 @@ export class Trader {
       if (side) {
         decision.action = side;
         const cancel = [...this.orders.keys()].filter((id) => id > 0); // simulated orders have negative ids
-        quote = await this.market.send(block, side, config.tradeSizeMon, book, cancel, side !== wanted);
+        // Never race/abort a broadcast: it may already have reached the chain.
+        quote = await this.market.send(block, side, config.tradeSizeMon, book, cancel, side !== wanted, window.assertFresh);
         this.totals.quotes++;
         if (quote.status === "sim") {
           this.orders.clear(); // the simulated cancel
@@ -122,12 +257,57 @@ export class Trader {
           this.inflight.set(quote.txHash, quote);
         }
       }
+      if (!side && (this.orders.size || this.inflight.size)) {
+        this.protect(decision.action === "hold" ? "model_hold" : "quoting_blocked");
+        await this.cancelForProtection(block);
+      }
       this.emit(block, book, decision, quote, false, { readMs: Math.round(readMs), loopMs: Math.round(performance.now() - t0) });
     } catch (e) {
-      console.error(`block ${block}:`, (e as Error).message);
+      if (e instanceof DecisionExpired) {
+        this.totals.lateBlocks++;
+        if (this.lastBook) this.emit(block, this.lastBook, null, null, true);
+      } else {
+        console.error(`block ${block}:`, (e as Error).message);
+      }
+      if (this.orders.size || this.inflight.size) {
+        try {
+          this.protect(e instanceof DecisionExpired ? "decision_expired" : "decision_failed");
+          await this.cancelForProtection(this.newestBlock);
+        } catch (error) { console.error("protection:", (error as Error).message); }
+      }
     } finally {
+      window.dispose();
+      this.window = null;
+      for (const skipped of this.skipped) {
+        if (this.lastBook) this.emit(skipped, this.lastBook, null, null, true);
+      }
+      this.skipped = [];
       this.busy = false;
     }
+  }
+
+  private protect(reason: string | null) {
+    if (this.protection === reason || (this.protection === "cancellation_failed" && reason !== null)) return;
+    this.market.journal?.append({ type: "protection", reason });
+    this.protection = reason;
+  }
+
+  /** Runs under the same busy lock as quoting; never clears exposure at submission time. */
+  private async cancelForProtection(block: number) {
+    if (!this.protection || this.protection === "cancellation_failed") return;
+    if (this.market.journal && !this.market.journal.available) return;
+    if (this.inflight.size || this.market.hasUncertainTransactions) return;
+    if (this.market.journal && (!this.trades || this.trades.lastBlock < block)) return;
+    if (!this.orders.size) { if (!this.market.quoteBudgetReason && !this.modelBudgetReason) this.protect(null); return; }
+    if (!this.market.journal && !this.market.wallet) {
+      this.orders.clear(); // simulation never signs or broadcasts
+      this.protect(null);
+      return;
+    }
+    const quote = await this.market.cancelOrders(block, [...this.orders.keys()]);
+    if (quote.txHash) this.inflight.set(quote.txHash, quote);
+    this.totals.quotes++;
+    this.onQuote(block, quote);
   }
 
   /** One eth_getTransactionReceipt per in-flight tx, in parallel with this block's decision. */
@@ -137,15 +317,43 @@ export class Trader {
     }).catch(() => {});
   }
 
-  private applyQuoteResult({ block, quote, canceled }: QuoteResult) {
-    if (quote.txHash) this.inflight.delete(quote.txHash);
+  private applyQuoteResult({ block, quote, canceled }: QuoteResult, notify = true) {
+    if (quote.status !== "lost" && quote.txHash) {
+      if (this.receipts.has(quote.txHash)) return;
+      this.receipts.add(quote.txHash);
+    }
+    if (quote.txHash && quote.status !== "lost") this.inflight.delete(quote.txHash);
     this.totals.gasMon += quote.gasMon; // charged on reverts too
-    if (quote.status === "reverted") this.totals.reverted++;
-    for (const id of canceled) this.orders.delete(id);
-    if (quote.status === "placed" && quote.orderId !== null) this.orders.set(quote.orderId, { side: quote.side, price: quote.price, size: quote.size, block });
+    if (quote.status === "reverted") {
+      this.totals.reverted++;
+      // The receipt itself durably latches this state on replay: no gas-burning retry loop.
+      if (quote.kind === "cancel") this.protection = "cancellation_failed";
+    }
+    for (const id of canceled) { this.canceledOrders.add(id); this.orders.delete(id); }
+    if (quote.status === "placed" && quote.orderId !== null && !this.canceledOrders.has(quote.orderId)) {
+      const size = Math.min(quote.size, this.remainingSizes.get(quote.orderId) ?? quote.size);
+      if (size > 0) this.orders.set(quote.orderId, { side: quote.side, price: quote.price, size, block });
+    }
     const e = this.history.find((h) => h.block === block);
     if (e) e.quote = quote;
-    this.onQuote(block, quote);
+    if (notify) this.onQuote(block, quote);
+  }
+
+  private applyLiveBatch(raw: MakerFill[], notify = true) {
+    const byBlock = new Map<number, Fill[]>();
+    for (const fill of this.liveFills(raw)) {
+      this.applyFill(fill);
+      if (notify) byBlock.set(fill.block, [...(byBlock.get(fill.block) ?? []), fill]);
+    }
+    for (const [block, fills] of byBlock) {
+      const all = [...(this.recentLiveFills.get(block) ?? []), ...fills];
+      this.recentLiveFills.set(block, all);
+      if (this.recentLiveFills.size > config.historySize) this.recentLiveFills.delete(this.recentLiveFills.keys().next().value!);
+      const aggregateFill = aggregate(all);
+      const event = this.history.find(event => event.block === block);
+      if (event) event.fill = aggregateFill;
+      this.onFill(block, aggregateFill);
+    }
   }
 
   /** After each trade-log poll: apply our maker fills (live) or simulate them against the new prints (dry run). */
@@ -171,9 +379,14 @@ export class Trader {
   private liveFills(raw: MakerFill[]): (Fill & { block: number })[] {
     const out: (Fill & { block: number })[] = [];
     for (const f of raw) {
+      const key = `${f.txHash.toLowerCase()}:${f.logIndex}`;
+      if (this.fillIds.has(key)) continue;
+      this.fillIds.add(key);
+      const remaining = Math.min(f.updatedSize, this.remainingSizes.get(f.orderId) ?? Infinity);
+      this.remainingSizes.set(f.orderId, remaining);
       const o = this.orders.get(f.orderId);
-      if (f.updatedSize <= 0) this.orders.delete(f.orderId);
-      else if (o) o.size = f.updatedSize;
+      if (remaining <= 0 || this.canceledOrders.has(f.orderId)) this.orders.delete(f.orderId);
+      else if (o) o.size = Math.min(o.size, remaining);
       out.push({ side: f.side, size: f.size, price: f.price, txHash: f.txHash, orderId: f.orderId, simulated: false, block: f.block });
     }
     return out;
@@ -208,6 +421,8 @@ export class Trader {
 
   /** Would this order, and everything already resting on its side, keep us inside the cap and (live) inside margin funds? */
   private allowed(side: Side, book: Book) {
+    if (this.market.journal && (!this.market.journal.available || !this.recovered || !this.trades || this.trades.lastBlock < this.newestBlock)) return false;
+    if (this.protection || this.market.quoteBudgetReason || this.market.hasUncertainTransactions) return false;
     const size = config.tradeSizeMon;
     const exposure = side === "buy" ? this.position.mon + this.restingMon("buy") + size : this.position.mon - this.restingMon("sell") - size;
     if (Math.abs(exposure) > config.maxPositionMon) return false;
@@ -278,7 +493,7 @@ export class Trader {
         ? { action: "hold", probabilities: { buy: 0, sell: 0, hold: 1 }, upIn10: 0.5, latencyMs: 0, late: true }
         : decision && { action: decision.action, probabilities: decision.probabilities, upIn10: decision.upIn10, latencyMs: Math.round(decision.latencyMs), late: false },
       quote,
-      fill: null,
+      fill: this.recentLiveFills.has(block) ? aggregate(this.recentLiveFills.get(block)!) : null,
       resting: { bidMon: round(this.restingMon("buy"), 1), askMon: round(this.restingMon("sell"), 1) },
       position: {
         side: this.position.mon > 0 ? "long" : this.position.mon < 0 ? "short" : "flat",
@@ -288,7 +503,7 @@ export class Trader {
     };
     this.history.push(event);
     if (this.history.length > config.historySize) this.history.shift();
-    appendFileSync("data/events.jsonl", JSON.stringify(event) + "\n");
+    appendFileSync(join(this.dataDir, "events.jsonl"), JSON.stringify(event) + "\n");
     this.onEvent(event, timing);
   }
 }

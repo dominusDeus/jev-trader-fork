@@ -36,7 +36,8 @@ export interface Decision {
 
 export interface Model {
   readonly name: string;
-  decide(state: TradeState): Promise<Decision>;
+  readonly paid?: boolean;
+  decide(state: TradeState, signal?: AbortSignal): Promise<Decision>;
 }
 
 const QUESTIONS = {
@@ -57,12 +58,13 @@ const QUESTIONS = {
 
 /** Real Jev via the AI SDK. Swap-in is the MODEL env var. */
 export class JevModel implements Model {
+  readonly paid = true;
   readonly name = config.jevModelId;
   private model = typeSafeAi.evaluationModel(config.jevModelId);
 
-  async decide(state: TradeState): Promise<Decision> {
+  async decide(state: TradeState, signal?: AbortSignal): Promise<Decision> {
     const t0 = performance.now();
-    const r = await experimental_evaluate({ model: this.model, state: state as any, questions: QUESTIONS, maxRetries: 0 });
+    const r = await experimental_evaluate({ model: this.model, state: state as any, questions: QUESTIONS, maxRetries: 0, abortSignal: signal });
     const a = r.answers.direction;
     const p = a.probabilities ?? { buy: 0, sell: 0, [a.choice]: 1 };
     const buy = p.buy ?? 0, sell = p.sell ?? 0;

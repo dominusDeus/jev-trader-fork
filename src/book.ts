@@ -29,6 +29,7 @@ export interface ReadBookOptions {
   /** eth_call block tag. Default "latest". */
   blockTag?: string;
   timeoutMs?: number;
+  signal?: AbortSignal;
 }
 
 export interface VaultParams {
@@ -56,12 +57,12 @@ const MAX_UINT256 = (1n << 256n) - 1n;
 type RpcProvider = ethers.providers.JsonRpcProvider | string;
 const urlOf = (p: RpcProvider) => (typeof p === "string" ? p : p.connection.url);
 
-async function rpcPost(url: string, body: unknown, timeoutMs?: number): Promise<any> {
+async function rpcPost(url: string, body: unknown, timeoutMs?: number, signal?: AbortSignal): Promise<any> {
   const res = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
-    signal: timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined,
+    signal: signal && timeoutMs ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : signal ?? (timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined),
   });
   if (!res.ok) throw new Error(`rpc http ${res.status}`);
   return res.json();
@@ -74,7 +75,7 @@ export async function readBook(provider: RpcProvider, market: string, params: Bo
   const url = urlOf(provider);
   const tag = opts.blockTag ?? "latest";
   const l2Call = ethCall(1, market, SEL_GET_L2_BOOK, tag);
-  const json = await rpcPost(url, opts.vault ? [l2Call, ethCall(2, market, SEL_GET_VAULT_PARAMS, tag)] : l2Call, opts.timeoutMs);
+  const json = await rpcPost(url, opts.vault ? [l2Call, ethCall(2, market, SEL_GET_VAULT_PARAMS, tag)] : l2Call, opts.timeoutMs, opts.signal);
   const responses: any[] = Array.isArray(json) ? json : [json];
   const byId = new Map(responses.map((r) => [r.id, r]));
   const l2 = byId.get(1);

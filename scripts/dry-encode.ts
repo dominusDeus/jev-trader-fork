@@ -17,7 +17,7 @@ const RPC = process.argv[2] ?? config.readRpcUrl;
 const provider = new ethers.providers.StaticJsonRpcProvider(RPC, config.chainId);
 const iface = new ethers.utils.Interface(OrderBookAbi.abi);
 
-const market = new Market();
+const market = new Market({ offline: true }); // cannot initialize or send live orders
 market.params = await Kuru.ParamFetcher.getMarketParams(provider, config.market);
 const book = await market.readBook();
 const size = config.tradeSizeMon;
