@@ -1,5 +1,23 @@
 # Punto de retomada — Jev Trader
 
+## Cambio de alcance: IBKR — primera implementación 19/09/2026
+
+El usuario definió IBKR, cuenta Cash, residencia fiscal España, EE. UU. + Europa, acciones/ETFs/bonos/opciones/futuros. Ya tiene ETFs que no quiere tocar y USD 100 inicialmente libres; pidió dejar la configuración de qué operar y límites para el final. Autorizó continuar la adaptación por Paper. No hay permiso para operar sus ETFs, abrir posiciones reales ni mover fondos. No volver a enfocar nuevos incrementos en gas/Kuru.
+
+Los seis incrementos anteriores están ahora en commit `93df338` (usuario: “primeras mejoras en jev trader | sin IB aun”). Partimos de árbol limpio. Esta entrega IBKR queda local, sin commit.
+
+Implementado `src/ibkr/inspect.ts` + `reader.py`: lector de cuenta Paper sólo local, cuenta DU explícita en sesión, descarga completa de valores/posiciones por reqAccountUpdates. Espera handshake + accountDownloadEnd, rechaza errores/desconexión/not-ready/vacío. Sin modelos, órdenes, cancelaciones, transferencias, servidor ni persistencia de cartera. Contratos multiinstrumento y divisas preservados, decimales como texto. DU/puertos son guardas, no prueba absoluta de Paper; readOnly describe capacidad del lector, no ajuste verificado de TWS.
+
+SDK oficial descargado desde IBKR, API 10.50.2 y protobuf 5.29.5 instalados sólo en `/private/tmp/jev-ibkr-venv`. Prueba de callbacks sobre SDK real pasó sin conexión. Guía completa/versiones/checksum/comandos en `docs/IBKR-PAPER.md`.
+
+Validación actual: 106 pruebas Bun (407 aserciones) + 8 pruebas Python pasan; typecheck correcto. No hubo conexión IBKR autenticada: falta sesión Paper abierta e identificador de cuenta configurado por el usuario. No acceder a credenciales ni intentar conectar por inferencia a una sesión real. `ibkr:inspect` no carga .env ni config cripto. `start` sigue siendo Kuru; guía lo advierte.
+
+Siguiente: verificar lectura con Paper cuando esté disponible; agregar consulta de contratos y órdenes abiertas, después interfaz común IBKR de ejecución simulada y riesgo. Sin límite de pérdidas/equity IBKR todavía, sin asignar los ETFs o saldo total al bot. Clasificación Cash y permisos no verificados por el lector. No inferir ETF sólo desde secType=STK. Límites económicos y activos autorizados se cierran antes de cualquier habilitación real.
+
+Prompt actualizado: “Continuá la migración de Jev Trader a IBKR Paper. Leé RETOMAR.md y docs/IBKR-PAPER.md. El lector de sólo lectura está implementado y probado sin conexión autenticada. Preservá Kuru como legado y los cambios locales. Seguí con la integración IBKR multiinstrumento, sin tocar ETFs existentes, transferir fondos ni habilitar operaciones reales. Los límites/asignaciones se definen al final.”
+
+---
+
 ## Pedido y estado actual
 
 El usuario pidió análisis y plan de seguridad, usabilidad, calidad y trading; luego confirmó autonomía y autorizó empezar la implementación y continuar. Operación normal sin aprobación humana por orden, siempre dentro de límites previos. No habilitar fondos reales ni desplegar por inferencia.

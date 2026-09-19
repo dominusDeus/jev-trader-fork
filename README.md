@@ -1,5 +1,7 @@
 # jev-trader
 
+**IBKR migration in progress:** the new paper-only account reader is available with `bun run ibkr:inspect`. See [IBKR Paper setup](docs/IBKR-PAPER.md). It cannot place or cancel orders. The remainder of this README and `bun run start` describe the legacy Kuru implementation.
+
 One decision every Monad block. A TypeSafe Jev model watches the Kuru MON-USDC order book and answers buy or sell every ~300 ms. Every block posts a real post-only limit order on that side, one tick inside the touch, replacing the last one. Fills happen when a taker hits it, so the bot earns the spread instead of paying it. A small server streams every block to the dashboard.
 
 ## Run

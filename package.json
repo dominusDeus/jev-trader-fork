@@ -20,6 +20,8 @@
     "start": "bun run src/index.ts",
     "dev": "bun --watch run src/index.ts",
     "test": "bun test --no-env-file --preload ./tests/setup.ts ./tests",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "ibkr:inspect": "bun --no-env-file run src/ibkr/inspect.ts",
+    "test:ibkr": "python3 -m unittest discover -s tests/ibkr -v"
   }
 }
